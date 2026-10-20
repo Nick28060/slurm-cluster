@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 
-SCRIPT_VERSION = "2026-10-20.1"
+SCRIPT_VERSION = "2026-10-20.2"
 
 
 def read_text(path, limit=65536):
@@ -137,6 +137,10 @@ def collect_packages():
         "dnf", "dnf-data", "python3-dnf", "libdnf", "python3-libdnf",
         "python3-hawkey", "libsolv", "python3-libsolv", "rpm", "rpm-libs",
         "python3-rpm", "python3", "python3-libs",
+        # Kernel logs localized the observed DNF SIGSEGV to librepo.so.0.
+        "librepo", "python3-librepo", "libcurl", "libcurl-minimal",
+        "curl", "curl-minimal", "libxml2", "openssl-libs", "glib2",
+        "libgpg-error", "gpgme", "zchunk-libs", "libzstd", "zlib",
     ]
     slurm_packages = [
         "slurm", "slurm-libs", "slurm-slurmd", "slurm-slurmctld",
@@ -157,6 +161,16 @@ def collect_packages():
         "slurm_package_files": ["rpm", "-ql", *slurm_packages],
         "slurm_changelog": ["rpm", "-q", "--changelog", "slurm", "slurm-libs"],
         "dnf_path_ownership": ["rpm", "-qf", "/usr/bin/dnf", "/usr/bin/python3"],
+        "librepo_path_ownership": ["rpm", "-qf",
+                                   "/usr/lib64/librepo.so.0", "/lib64/librepo.so.0"],
+        "librepo_package_metadata": ["rpm", "-q", "--qf",
+                                     "%{NAME} %{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\n"
+                                     "Vendor: %{VENDOR}\nSource RPM: %{SOURCERPM}\n",
+                                     "librepo", "libcurl", "libcurl-minimal"],
+        "librepo_requirements": ["rpm", "-q", "--requires", "librepo"],
+        "librepo_changelog": ["rpm", "-q", "--changelog", "librepo"],
+        "librepo_elf_dependencies": ["readelf", "--dynamic", "/usr/lib64/librepo.so.0"],
+        "librepo_elf_build_id": ["readelf", "--notes", "/usr/lib64/librepo.so.0"],
         "system_python": ["/usr/bin/python3", "--version"],
         "systemd_version": ["systemctl", "--version"],
         "cgroup_mounts": ["findmnt", "-rn", "-t", "cgroup,cgroup2",
@@ -204,6 +218,9 @@ def collect_packages():
             "Missing packages, denied journal access and nonzero statuses remain visible.",
             "Empty filtered changelog output does not prove absence of a vendor backport.",
             "Package files/metadata do not by themselves certify cgroup v2 or NVML support.",
+            "Optional library variants may be absent; that is not a recommendation to install them.",
+            "RPM T-only output means a timestamp difference, not a content checksum mismatch.",
+            "readelf only inspects ELF data; target libraries are not loaded or executed.",
             "No MUNGE keys, credentials, environment values or repository config files are read.",
         ],
     }
