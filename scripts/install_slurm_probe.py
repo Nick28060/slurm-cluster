@@ -27,7 +27,7 @@ import tarfile
 import tempfile
 import time
 
-VERSION = "2026-10-20.1"
+VERSION = "2026-10-20.2"
 PACKAGES = ("munge", "munge-libs", "slurm", "slurm-libs", "slurm-slurmctld", "slurm-slurmd")
 SERVICES = ("munge", "slurmctld", "slurmd")
 CONFIG_PATHS = ("/etc/slurm", "/etc/slurm.conf", "/etc/munge",
@@ -251,7 +251,9 @@ def munge_probe():
         with tempfile.TemporaryFile() as log:
             proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
                                     user=account.pw_uid, group=account.pw_gid, extra_groups=[],
-                                    cwd=temporary, start_new_session=True)
+                                    cwd=temporary, start_new_session=True,
+                                    env={**os.environ, "LC_ALL": "C"})
+            result = {"isolated_temporary_socket": True, "persistent_key_changed": False}
             try:
                 deadline = time.monotonic() + 8
                 while proc.poll() is None and not Path(sock).exists() and time.monotonic() < deadline:
@@ -259,14 +261,19 @@ def munge_probe():
                 require(proc.poll() is None and Path(sock).exists(), "Temporary munged did not become ready")
                 # Credentials are intentionally never included in the JSON.
                 encoded = subprocess.run([command("munge"), "--socket", sock, "-n"],
-                                         capture_output=True, timeout=10, check=False)
+                                         capture_output=True, timeout=10, check=False,
+                                         env={**os.environ, "LC_ALL": "C"})
+                result["encode_rc"] = encoded.returncode
                 require(encoded.returncode == 0, "Temporary MUNGE encoding failed")
                 decoded = subprocess.run([command("unmunge"), "--socket", sock],
-                                         input=encoded.stdout, capture_output=True, timeout=10, check=False)
-                return {"encode_rc": encoded.returncode, "decode_rc": decoded.returncode,
-                        "status_success": decoded.returncode == 0 and b"Success (0)" in decoded.stdout,
-                        "isolated_temporary_socket": True, "persistent_key_changed": False}
+                                         input=encoded.stdout, capture_output=True, timeout=10, check=False,
+                                         env={**os.environ, "LC_ALL": "C"})
+                result["decode_rc"] = decoded.returncode
+                result["status_success"] = decoded.returncode == 0 and b"Success (0)" in decoded.stdout
+            except Exception as error:
+                result["error"] = "{}: {}".format(type(error).__name__, error)
             finally:
+                result["daemon_returncode_before_cleanup"] = proc.poll()
                 if proc.poll() is None:
                     proc.terminate()
                     try:
@@ -274,10 +281,17 @@ def munge_probe():
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait(timeout=5)
+            log.seek(0)
+            result["daemon_stderr"] = log.read(32768).decode(errors="replace")
+            daemon_log = directory / "log"
+            if daemon_log.is_file():
+                with daemon_log.open(errors="replace") as stream:
+                    result["daemon_log"] = stream.read(32768)
+            return result
 
 
 def gres_probe(hardware, devices, cgroup_v2_parse=False):
-    require(hardware.get("rc") == 0 and devices, "Need slurmd -C and actual NVIDIA character devices")
+    require(hardware.get("rc") == 0, "Need successful slurmd -C")
     fields = dict(re.findall(r"\b(CPUs|Boards|SocketsPerBoard|CoresPerSocket|ThreadsPerCore)=([0-9]+)\b",
                              hardware.get("stdout", "")))
     require("CPUs" in fields, "Could not parse detected Slurm CPU topology")
@@ -288,16 +302,17 @@ def gres_probe(hardware, devices, cgroup_v2_parse=False):
             "ClusterName=component_probe", "SlurmctldHost=" + node + "(127.0.0.1)",
             "SlurmUser=root", "SlurmdUser=root", "AuthType=auth/munge",
             "StateSaveLocation=" + temporary, "SlurmdSpoolDir=" + temporary,
-            "SlurmdPidFile=" + temporary + "/slurmd.pid", "SlurmdLogFile=/dev/null",
+            "SlurmdPidFile=" + temporary + "/slurmd.pid", "SlurmdLogFile=" + temporary + "/slurmd.log",
             "SelectType=select/cons_tres", "SelectTypeParameters=CR_Core_Memory",
             "ProctrackType=proctrack/linuxproc", "TaskPlugin=task/none",
-            "JobAcctGatherType=jobacct_gather/none", "GresTypes=gpu",
+            "JobAcctGatherType=jobacct_gather/none", *(["GresTypes=gpu"] if devices else []),
             "NodeName=" + node + " NodeAddr=127.0.0.1 " +
-            " ".join(k + "=" + v for k, v in fields.items()) + " RealMemory=1024 Gres=gpu:" + str(len(devices)),
+            " ".join(k + "=" + v for k, v in fields.items()) + " RealMemory=1024" +
+            (" Gres=gpu:" + str(len(devices)) if devices else ""),
             "PartitionName=probe Nodes=" + node + " Default=YES State=UP", ""])
         path = directory / "slurm.conf"
         path.write_text(config)
-        (directory / "gres.conf").write_text("AutoDetect=nvml\n" + "".join(
+        (directory / "gres.conf").write_text(("AutoDetect=nvml\n" if devices else "") + "".join(
             "Name=gpu File=" + device + "\n" for device in devices))
         (directory / "cgroup.conf").write_text(
             ("CgroupPlugin=cgroup/v2\n" if cgroup_v2_parse else "") +
@@ -305,8 +320,13 @@ def gres_probe(hardware, devices, cgroup_v2_parse=False):
         result = run([command("slurmd"), "-G", "-N", node, "-f", str(path)], timeout=60,
                      env={"SLURM_CONF": str(path)})
         result["note"] = "GRES inspection only. RC 0 alone does not establish GPU count, NVML or job/device isolation; review output."
+        result["nvidia_autodetect_requested"] = bool(devices)
+        daemon_log = directory / "slurmd.log"
+        if daemon_log.is_file():
+            with daemon_log.open(errors="replace") as stream:
+                result["slurmd_log"] = stream.read(32768)
         if cgroup_v2_parse:
-            result["note"] = "Temporary CgroupPlugin=cgroup/v2 configuration parse through slurmd -G; no cgroup task/proctrack plugin or daemon is started. This does not verify runtime isolation."
+            result["note"] = "Temporary CgroupPlugin=cgroup/v2 configuration parse through slurmd -G; no GPU autodetection, cgroup task/proctrack plugin or daemon is started. This does not verify runtime isolation."
         return result
 
 
@@ -350,7 +370,8 @@ def collect_checks(report):
     report.data["cgroup_v2_assessment"] = "evidence_only_runtime_not_verified"
     for name, probe in (("munge_local", munge_probe),
                         ("gres_nvml", lambda: gres_probe(checks["slurm_hardware"], devices)),
-                        ("cgroup_v2_config_probe", lambda: gres_probe(checks["slurm_hardware"], devices, cgroup_v2_parse=True))):
+                        ("cpu_config_baseline", lambda: gres_probe(checks["slurm_hardware"], [])),
+                        ("cgroup_v2_config_probe", lambda: gres_probe(checks["slurm_hardware"], [], cgroup_v2_parse=True))):
         report.save("checking_" + name)
         try:
             checks[name] = probe()
