@@ -3,6 +3,7 @@
 
 sudo /usr/bin/python3 install_slurm_probe.py --install --target-host HOST
 Use --check-only to repeat checks without a package transaction.
+Add --munge-only to --check-only for just the isolated MUNGE test.
 No permanent configuration, service enable/start, key distribution or jobs.
 A temporary, isolated munged process tests encode/decode and is then stopped.
 Only NEW packages from existing base/updates are permitted, never upgrades.
@@ -27,7 +28,7 @@ import tarfile
 import tempfile
 import time
 
-VERSION = "2026-10-20.2"
+VERSION = "2026-10-20.3"
 PACKAGES = ("munge", "munge-libs", "slurm", "slurm-libs", "slurm-slurmctld", "slurm-slurmd")
 SERVICES = ("munge", "slurmctld", "slurmd")
 CONFIG_PATHS = ("/etc/slurm", "/etc/slurm.conf", "/etc/munge",
@@ -239,6 +240,9 @@ def munge_probe():
     with tempfile.TemporaryDirectory(prefix="slurm-munge-probe-", dir="/run") as temporary:
         directory = Path(temporary)
         os.chown(directory, account.pw_uid, account.pw_gid)
+        # munged requires every socket-directory ancestor to be traversable by
+        # clients. Permit traversal, but no listing/write; the key stays 0600.
+        directory.chmod(0o711)
         key = directory / "key"
         fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as stream:
@@ -394,12 +398,16 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--install", action="store_true")
     mode.add_argument("--check-only", action="store_true")
+    parser.add_argument("--munge-only", action="store_true", help="with --check-only: only test isolated MUNGE")
     parser.add_argument("--target-host", required=True)
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
+    if args.munge_only and not args.check_only:
+        parser.error("--munge-only requires --check-only")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.target_host):
         parser.error("Invalid target hostname")
     report = Report(args.target_host)
+    report.data["mode"] = "munge_only" if args.munge_only else ("install" if args.install else "check_only")
     base = rpm = None
     status = 1
     finalize_error = False
@@ -417,10 +425,17 @@ def main(argv=None):
             install_components(base, rpm, report)
             base.close()
             base = None
-        collect_checks(report)
-        versions = report.data["checks"]["package_versions"]
-        require(versions.get("rc") == 0, "One or more required packages are missing; review report")
-        report.save("packages_present_checks_recorded")
+        if args.munge_only:
+            report.save("checking_munge_local")
+            result = munge_probe()
+            report.data["checks"]["munge_local"] = result
+            require(result.get("status_success"), "Isolated MUNGE round trip failed; inspect daemon logs in report")
+            report.save("munge_check_passed")
+        else:
+            collect_checks(report)
+            versions = report.data["checks"]["package_versions"]
+            require(versions.get("rc") == 0, "One or more required packages are missing; review report")
+            report.save("packages_present_checks_recorded")
         status = 0
     except (Exception, KeyboardInterrupt) as error:
         report.data["error"] = "{}: {}".format(type(error).__name__, error)
