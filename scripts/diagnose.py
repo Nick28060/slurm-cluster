@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 
-SCRIPT_VERSION = "2026-10-20.2"
+SCRIPT_VERSION = "2026-10-20.3"
 
 
 def read_text(path, limit=65536):
@@ -226,15 +226,68 @@ def collect_packages():
     }
 
 
+def collect_curl_plan():
+    """Ask DNF for a cached transaction preview; --assumeno forbids applying it."""
+    report = {
+        "schema_version": 1,
+        "script_version": SCRIPT_VERSION,
+        "report_kind": "package_plan",
+        "collected_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "hostname": platform.node(),
+        "kernel": platform.release(),
+        "os_release": parse_os_release(read_text("/etc/os-release")),
+        "requested_packages": ["curl.x86_64", "libcurl.x86_64"],
+        "apply_supported": False,
+        "commands": {},
+        "notes": [
+            "This separate mode starts DNF with --assumeno; no RPM transaction is applied.",
+            "Only existing repository cache is used; metadata is not refreshed.",
+            "DNF plugins are disabled and GPG verification remains enabled.",
+            "The solver may propose dependencies beyond curl/libcurl; review all output.",
+            "DNF exit 1 may mean expected Operation aborted; it is not a passing installation test.",
+            "A timeout, SIGSEGV, missing cache or truncated output does not provide an approvable plan.",
+            "The earlier --packages-only mode still never starts DNF.",
+        ],
+    }
+    if os.geteuid() != 0:
+        report["state"] = "requires_root_for_dnf_preview"
+        report["error"] = "DNF upgrade demands root even with --assumeno; no command was started."
+        return report
+    if platform.machine() != "x86_64":
+        report["state"] = "unsupported_architecture"
+        return report
+    # Confine DNF logs to a new private temporary directory, never edit dnf.conf.
+    with tempfile.TemporaryDirectory(prefix=".slurm-dnf-plan-", dir=".") as logdir:
+        argv = [
+            "dnf", "--cacheonly", "--assumeno", "--noplugins",
+            "--setopt=assumeyes=False", "--setopt=gpgcheck=True",
+            "--setopt=logdir=" + str(Path(logdir).resolve()),
+            "--setopt=logfilelevel=0",
+            "upgrade", "curl.x86_64", "libcurl.x86_64",
+        ]
+        result = run(argv, timeout=60)
+    report["commands"]["curl_transaction_preview"] = result
+    report["state"] = "review_required"
+    if result["rc"] < 0 or result["rc"] in (124, 126, 127):
+        report["state"] = "preview_unavailable"
+    return report
+
+
 def save_report(report, directory="."):
     """Create a unique mode-0600 JSON; never replace an existing report."""
     hostname = re.sub(r"[^A-Za-z0-9_.-]", "_", report["hostname"])[:80] or "node"
-    kind = "packages" if report.get("report_kind") == "packages" else "report"
+    kind = {"packages": "packages", "package_plan": "plan"}.get(
+        report.get("report_kind"), "report",
+    )
     descriptor, filename = tempfile.mkstemp(
         prefix=f"slurm-{kind}-{hostname}-", suffix=".json", dir=directory,
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            # Let the invoking SSH/SFTP user retrieve a report created via sudo.
+            sudo_uid, sudo_gid = os.environ.get("SUDO_UID", ""), os.environ.get("SUDO_GID", "")
+            if os.geteuid() == 0 and sudo_uid.isdigit() and sudo_gid.isdigit() and int(sudo_uid) > 0:
+                os.fchown(output.fileno(), int(sudo_uid), int(sudo_gid))
             json.dump(report, output, indent=2, ensure_ascii=False)
             output.write("\n")
     except BaseException:
@@ -248,10 +301,14 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--cached-repos", action="store_true", help="inspect existing DNF metadata without refreshing it")
     mode.add_argument("--packages-only", action="store_true", help="read RPM/package diagnostics without starting DNF")
+    mode.add_argument("--plan-curl-update", action="store_true", help="preview curl/libcurl update with DNF --assumeno; requires root, never applies")
     parser.add_argument("--save-report", action="store_true", help="save a new protected JSON in the current directory")
     parser.add_argument("--version", action="version", version=SCRIPT_VERSION)
     args = parser.parse_args()
-    report = collect_packages() if args.packages_only else collect(args.cached_repos)
+    if args.plan_curl_update:
+        report = collect_curl_plan()
+    else:
+        report = collect_packages() if args.packages_only else collect(args.cached_repos)
     if args.save_report:
         print("Отчёт сохранён:", save_report(report))
     else:
